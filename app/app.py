@@ -5,19 +5,29 @@ import re
 import json
 
 app = FastAPI(
-    title="ABAP SELECT* Remediator for SAP Note 2768887 (Clean Output, No remediated_code)"
+    title="ABAP SELECT Remediator for SAP Note 2768887 (Handles Any Syntax)"
 )
 
-# Regex to match SELECT * FROM ...
-SELECT_STAR_RE = re.compile(
-    r"""(?P<full>SELECT\s+(?:SINGLE\s+)?\*\s+FROM\s+(?P<table>\w+)
-        (?P<middle>.*?)
-        (?:(?:INTO\s+TABLE\s+(?P<into_tab>\w+))|(?:INTO\s+(?P<into_wa>\w+)))
-        (?P<tail>.*?))\.""",
+# Regex to match:
+# SELECT <fields> FROM <table>
+#    ... optional clauses ...
+#    INTO TABLE <var> | INTO <var>
+# <var> can be simple name or @DATA(...) or lo_obj->attr
+SELECT_RE = re.compile(
+    r"""(?P<full>
+            SELECT\s+(?:SINGLE\s+)?         # SELECT or SELECT SINGLE
+            (?P<fields>[\w\s,*]+)           # fields list or *
+            \s+FROM\s+(?P<table>\w+)        # FROM table name
+            (?P<middle>.*?)                 # middle chunk up to INTO
+            (?:
+                (?:INTO\s+TABLE\s+(?P<into_tab>[\w@()\->]+))
+              | (?:INTO\s+(?P<into_wa>[\w@()\->]+))
+            )
+            (?P<tail>.*?)
+        )\.""",
     re.IGNORECASE | re.DOTALL | re.VERBOSE,
 )
 
-# Request/Response model
 class Unit(BaseModel):
     pgm_name: str
     inc_name: str
@@ -28,18 +38,19 @@ class Unit(BaseModel):
     end_line: Optional[int] = None
     code: Optional[str] = ""
 
-
-# ---------------- Core Functions ----------------
+# ---------------------------------------------------
+# Core functions
+# ---------------------------------------------------
 
 def ensure_draft_filter(sel_stmt: str, table: str) -> str:
-    """Ensure SELECT for VBRK/VBRP includes DRAFT = SPACE filter."""
+    """Add DRAFT = SPACE condition for VBRK/VBRP if missing."""
     table_up = table.upper()
     if table_up not in {"VBRK", "VBRP"}:
         return sel_stmt
-    # Check if filter already present
-    if re.search(rf"{table_up}-DRAFT\s*=\s*['\"]? ?['\"]?", sel_stmt, re.IGNORECASE):
+    # Already has DRAFT filter?
+    if re.search(rf"{table_up}-DRAFT\s*=\s*['\"]?\s?['\"]?", sel_stmt, re.IGNORECASE):
         return sel_stmt
-    # Add filter
+    # Insert before/into WHERE clause
     where_match = re.search(r"\bWHERE\b", sel_stmt, re.IGNORECASE)
     if where_match:
         start = where_match.end()
@@ -51,19 +62,15 @@ def ensure_draft_filter(sel_stmt: str, table: str) -> str:
         else:
             return sel_stmt.rstrip(".") + f" WHERE {table_up}-DRAFT = SPACE."
 
-
 def build_replacement_stmt(sel_text: str, table: str, target_type: str, target_name: str) -> str:
-    """Build the updated SELECT with DRAFT filter — ensure single line and spaces only."""
+    """Return single-line suggested statement with DRAFT filter."""
     stmt = ensure_draft_filter(sel_text, table)
-    # Remove excessive whitespace/newlines, keep single spaces
-    stmt = re.sub(r"\s+", " ", stmt).strip()
-    return stmt
-
+    return re.sub(r"\s+", " ", stmt).strip()
 
 def find_selects(txt: str):
-    """Find all SELECT * statements in code."""
+    """Regex find all SELECT statements."""
     out = []
-    for m in SELECT_STAR_RE.finditer(txt):
+    for m in SELECT_RE.finditer(txt):
         out.append({
             "text": m.group("full"),
             "table": m.group("table"),
@@ -73,20 +80,22 @@ def find_selects(txt: str):
         })
     return out
 
-
 def apply_span_replacements(source: str, repls: List[Tuple[Tuple[int, int], str]]) -> str:
-    """Replace code segments based on character spans."""
+    """Replace segments in the ABAP source."""
     out = source
     for (s, e), r in sorted(repls, key=lambda x: x[0][0], reverse=True):
         out = out[:s] + r + out[e:]
     return out
 
-
-# ---------------- API Endpoint ----------------
-
+# ---------------------------------------------------
+# API endpoint
+# ---------------------------------------------------
 @app.post("/remediate-array")
 def remediate_array(units: List[Unit]):
-    """Find & remediate SELECT * from VBRK/VBRP — return clean suggested statements without remediated_code."""
+    """
+    Find and remediate all VBRK/VBRP SELECTs (any field list, any INTO syntax).
+    Only these tables are included in 'selects' output.
+    """
     results = []
     for u in units:
         src = u.code or ""
@@ -95,29 +104,25 @@ def remediate_array(units: List[Unit]):
         selects_metadata = []
 
         for sel in selects:
-            sel_info = {
-                "table": sel["table"],
-                "target_type": sel["target_type"],
-                "target_name": sel["target_name"],
-                "start_char_in_unit": sel["span"][0],
-                "end_char_in_unit": sel["span"][1],
-                "used_fields": [],           # Not scanning fields in this simple example
-                "ambiguous": False,          # Always false here, no complex detection
-                "suggested_fields": None,
-                "suggested_statement": None
-            }
-
             if sel["table"].upper() in ("VBRK", "VBRP"):
-                new_stmt = build_replacement_stmt(
-                    sel["text"], sel["table"], sel["target_type"], sel["target_name"]
-                )
+                sel_info = {
+                    "table": sel["table"],
+                    "target_type": sel["target_type"],
+                    "target_name": sel["target_name"],
+                    "start_char_in_unit": sel["span"][0],
+                    "end_char_in_unit": sel["span"][1],
+                    "used_fields": [],
+                    "ambiguous": False,
+                    "suggested_fields": None,
+                    "suggested_statement": None
+                }
+                new_stmt = build_replacement_stmt(sel["text"], sel["table"], sel["target_type"], sel["target_name"])
                 if new_stmt != sel["text"]:
                     replacements.append((sel["span"], new_stmt))
                     sel_info["suggested_statement"] = new_stmt
+                selects_metadata.append(sel_info)
 
-            selects_metadata.append(sel_info)
-
-        # Apply replacement internally (not returned)
+        # Apply replacements internally (to check for correctness but not return)
         _ = apply_span_replacements(src, replacements)
 
         obj = json.loads(u.model_dump_json())
