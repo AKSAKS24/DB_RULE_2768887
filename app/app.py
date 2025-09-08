@@ -10,10 +10,10 @@ app = FastAPI(
 
 SELECT_RE = re.compile(
     r"""(?P<full>
-            SELECT\s+(?:SINGLE\s+)?         # SELECT or SELECT SINGLE
-            (?P<fields>[\w\s,*]+)           # fields list or *
-            \s+FROM\s+(?P<table>\w+)        # FROM table name
-            (?P<middle>.*?)                 # middle chunk up to INTO
+            SELECT\s+(?:SINGLE\s+)?         
+            (?P<fields>[\w\s,*]+)           
+            \s+FROM\s+(?P<table>\w+)        
+            (?P<middle>.*?)                 
             (?:
                 (?:INTO\s+TABLE\s+(?P<into_tab>[\w@()\->]+))
               | (?:INTO\s+(?P<into_wa>[\w@()\->]+))
@@ -88,7 +88,12 @@ def remediate_array(units: List[Unit]):
         selects_metadata = []
         for sel in selects:
             if sel["table"].upper() in ("VBRK", "VBRP"):
-                new_stmt = build_replacement_stmt(sel["text"], sel["table"], sel["target_type"], sel["target_name"])
+                new_stmt = build_replacement_stmt(
+                    sel["text"], 
+                    sel["table"], 
+                    sel["target_type"], 
+                    sel["target_name"]
+                )
                 table_up = sel["table"].upper()
                 if new_stmt != sel["text"]:
                     eng_suggestion = (
@@ -109,14 +114,18 @@ def remediate_array(units: List[Unit]):
                     }
                     replacements.append((sel["span"], new_stmt))
                     selects_metadata.append(sel_info)
-                # If the select is already correct (new_stmt == sel["text"]), skip appending
         remediated_code = apply_span_replacements(src, replacements)
         result = json.loads(u.model_dump_json())
-        result.update({
-            "original_code": src,
-            "remediated_code": remediated_code,
-            "selects": selects_metadata
-        })
+        result["original_code"] = src
+        result["remediated_code"] = remediated_code
+        result["selects"] = selects_metadata
         results.append(result)
 
-    return {"results": results}
+    # ------- KEY: Return "system style" ------
+    if len(results) == 1:
+        return results[0]
+    return results
+
+@app.get("/health")
+def health():
+    return {"ok": True}
