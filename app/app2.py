@@ -8,7 +8,7 @@ app = FastAPI(
     title="ABAP SELECT Remediator for SAP Note 2768887 (Handles Any Syntax, including JOINS)"
 )
 
-# Improved regex: matches SELECT ... FROM ... [JOIN ...] ... INTO ... .
+# Improved regex: matches SELECT ... FROM ... [JOIN ...] ... INTO ...
 SELECT_RE = re.compile(
     r"""(?P<full>
         SELECT\s+(?:SINGLE\s+)?                # SELECT or SELECT SINGLE
@@ -40,26 +40,22 @@ class Unit(BaseModel):
 def extract_tables(from_clause: str) -> list:
     """
     Extract all tables (and aliases if present) used in FROM and all JOINs.
-    Returns list of dicts with {table: 'VBRK', alias: 'B'}.
+    Returns list of dicts with {table: 'VBRK', alias: 'A'}.
     """
     tables = []
     # Split main FROM and all JOINs
     join_parts = re.split(r'\bJOIN\b', from_clause, flags=re.IGNORECASE)
     tbl_alias_re = re.compile(r'(\w+)(?:\s+(?:AS\s+)?(\w+))?', re.IGNORECASE)
     for join_part in join_parts:
-        # Cut at ON if present
         join_part = re.split(r'\bON\b', join_part, flags=re.IGNORECASE)[0]
         candidates = join_part.split(',')
         for candidate in candidates:
-            cand = candidate.strip()
-            if not cand:
-                continue
-            m = tbl_alias_re.match(cand)
+            m = tbl_alias_re.match(candidate.strip())
             if m:
-                table = (m.group(1) or "").upper()
-                alias = (m.group(2) or m.group(1) or "").upper()
-                if table:
-                    tables.append({"table": table, "alias": alias})
+                tables.append({
+                    "table": m.group(1).upper(),
+                    "alias": (m.group(2) or m.group(1)).upper()
+                })
     return tables
 
 def find_selects(txt: str):
@@ -84,77 +80,46 @@ def find_selects(txt: str):
         })
     return out
 
-# --- Helpers for draft filter handling ---
-
-def _has_draft_check(sel_stmt: str, alias: str) -> bool:
-    """
-    Detects if a draft filter is already present for the given alias. Accepts:
-      alias~draft = space
-      alias~draft = ' '
-      alias~draft = ''
-      alias~draft = abap_false / ABAP_FALSE
-    """
-    # ABAP uses "~" for alias-qualified fields, not "-"
-    pat = rf"{re.escape(alias)}\s*~\s*draft\s*=\s*(SPACE|' '|\"\"|''|abap_false|ABAP_FALSE)"
-    return re.search(pat, sel_stmt, flags=re.IGNORECASE) is not None
-
-def _insert_after_where(sel_stmt: str, draft_checks: str) -> str:
-    """
-    Insert 'draft_checks AND ' immediately after the WHERE token.
-    Keeps original formatting; only injects the additional predicate.
-    """
-    m_where = re.search(r"\bWHERE\b", sel_stmt, flags=re.IGNORECASE)
-    if not m_where:
-        return sel_stmt
-    insert_pos = m_where.end()
-    # Add a space before and after to be safe w.r.t. formatting
-    return sel_stmt[:insert_pos] + f" {draft_checks} AND" + sel_stmt[insert_pos:]
-
-def _insert_before_into_or_end(sel_stmt: str, draft_checks: str) -> str:
-    """
-    If no WHERE exists, create one before INTO; if no INTO either, append at end.
-    """
-    m_into = re.search(r"\bINTO\b", sel_stmt, flags=re.IGNORECASE)
-    if m_into:
-        return sel_stmt[:m_into.start()] + f" WHERE {draft_checks} " + sel_stmt[m_into.start():]
-    # Place before ORDER/GROUP/HAVING if present (very rare without WHERE)
-    m_clause = re.search(r"\b(ORDER|GROUP|HAVING)\b", sel_stmt, flags=re.IGNORECASE)
-    if m_clause:
-        return sel_stmt[:m_clause.start()] + f" WHERE {draft_checks} " + sel_stmt[m_clause.start():]
-    # Otherwise, before final period
-    return sel_stmt.rstrip(".") + f" WHERE {draft_checks}."
-
 def ensure_draft_filter(sel_stmt: str, tables: list) -> str:
     """
-    Adds the DRAFT = SPACE condition to all VBRK/VBRP tables in sel_stmt (using aliases if present).
+    Adds the DRAFT=SPACE condition to all VBRK/VBRP tables in sel_stmt (using aliases if present).
     Will not duplicate if already present.
-    Uses alias~draft (ABAP syntax).
     """
     v_tables = [t for t in tables if t["table"] in ("VBRK", "VBRP")]
     if not v_tables:
         return sel_stmt
-
-    # If ALL relevant aliases already have a draft filter, do nothing
-    if all(_has_draft_check(sel_stmt, t["alias"]) for t in v_tables):
+    # If any DRAFT already present for any relevant alias, skip
+    already_filtered = False
+    for t in v_tables:
+        pat = rf"{t['alias']}-DRAFT\s*=\s*['\"]?\s?['\"]?"
+        if re.search(pat, sel_stmt, re.IGNORECASE):
+            already_filtered = True
+            break
+    if already_filtered:
         return sel_stmt
 
-    # Build checks for the ones missing
-    need_aliases = [t["alias"] for t in v_tables if not _has_draft_check(sel_stmt, t["alias"])]
-    if not need_aliases:
-        return sel_stmt
+    # Prepare draft check segment with correct alias per table:
+    draft_checks = " AND ".join([f"{t['alias']}-DRAFT = SPACE" for t in v_tables])
 
-    draft_checks = " AND ".join([f"{a}~draft = space" for a in need_aliases])
-
-    if re.search(r"\bWHERE\b", sel_stmt, flags=re.IGNORECASE):
-        return _insert_after_where(sel_stmt, draft_checks)
+    # Insert into WHERE-clause, or create WHERE if missing (before INTO):
+    m_where = re.search(r"\bWHERE\b", sel_stmt, re.IGNORECASE)
+    if m_where:
+        # After WHERE, before first condition (or as first AND):
+        insert_pos = m_where.end()
+        stmt = sel_stmt[:insert_pos] + f" {draft_checks} AND" + sel_stmt[insert_pos:]
     else:
-        return _insert_before_into_or_end(sel_stmt, draft_checks)
+        # Place before INTO
+        m = re.search(r"\bINTO\b", sel_stmt, re.IGNORECASE)
+        if m:
+            stmt = sel_stmt[:m.start()] + f" WHERE {draft_checks} " + sel_stmt[m.start():]
+        else:
+            # Append at end as new WHERE segment
+            stmt = sel_stmt.rstrip(".") + f" WHERE {draft_checks}."
+    return stmt
 
 def build_replacement_stmt(sel_text: str, tables: list, target_type: str, target_name: str) -> str:
-    """
-    Return the remediated statement WITHOUT collapsing whitespace, so the full code shape is preserved.
-    """
-    return ensure_draft_filter(sel_text, tables)
+    stmt = ensure_draft_filter(sel_text, tables)
+    return re.sub(r"\s+", " ", stmt).strip()
 
 def apply_span_replacements(source: str, repls: List[Tuple[Tuple[int, int], str]]) -> str:
     out = source
@@ -182,12 +147,11 @@ async def remediate_array(units: List[Unit]):
                 sel["target_type"],
                 sel["target_name"]
             )
+            # Only include if remediation is needed
             if new_stmt != sel["text"]:
                 table_list = ", ".join([f"{t['table']} ({t['alias']})" for t in sel["tables"] if t["table"] in ("VBRK", "VBRP")])
-                # IMPORTANT: include the full remediated SELECT in the suggestion message
                 eng_suggestion = (
-                    f"For this SELECT with join on {table_list}, add condition(s) '[alias]~draft = space' per SAP Note 2768887.\n"
-                    f"Remediated SELECT:\n{new_stmt}"
+                    f"For this SELECT with join on {table_list}, add condition(s) '[alias]-DRAFT = SPACE' for each relevant table."
                 )
                 sel_info = {
                     "tables": sel["tables"],
@@ -211,6 +175,7 @@ async def remediate_array(units: List[Unit]):
         result["selects"] = selects_metadata
         results.append(result)
 
+    # ------- KEY: Return "system style" ------
     if len(results) == 1:
         return results[0]
     return results
